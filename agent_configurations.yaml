@@ -1,0 +1,1188 @@
+# Drone Design Optimizer - Specialized Agent Configurations
+# =========================================================
+# This file defines a multi-agent system for drone flight time optimization.
+# Each agent has a focused responsibility, specific tools, and clear handoff protocols.
+
+version: "1.0"
+name: "DroneDesignOptimizer Multi-Agent System"
+description: |
+  A coordinated multi-agent system for optimizing drone designs across four configurations:
+  Tandem Wing, Flying Wing, Traditional, and VTOL 4+1. The system processes 1M+ design
+  iterations, evaluates aerodynamic performance, and generates interactive HTML dashboards.
+
+# =============================================================================
+# GLOBAL SETTINGS
+# =============================================================================
+global_settings:
+  max_concurrent_agents: 4
+  default_timeout_seconds: 300
+  retry_policy:
+    max_retries: 3
+    backoff_multiplier: 2
+  logging_level: "INFO"
+  shared_memory_enabled: true
+
+# =============================================================================
+# AGENT DEFINITIONS
+# =============================================================================
+agents:
+
+  # ---------------------------------------------------------------------------
+  # COORDINATOR AGENT (Orchestrator)
+  # ---------------------------------------------------------------------------
+  coordinator:
+    name: "Workflow Coordinator"
+    role: "orchestrator"
+    description: |
+      Central orchestrator that manages the optimization workflow, delegates tasks
+      to specialized agents, aggregates results, and ensures proper sequencing.
+
+    system_prompt: |
+      You are the Workflow Coordinator for the Drone Design Optimizer system.
+
+      ## Your Responsibilities:
+      1. Parse user configuration requests (aircraft types, constraints, sample sizes)
+      2. Orchestrate the optimization workflow by delegating to specialized agents
+      3. Manage data flow between agents and ensure proper sequencing
+      4. Aggregate results from all agents into a cohesive output
+      5. Handle errors gracefully with appropriate fallbacks
+      6. Provide progress updates to the user
+
+      ## Workflow Sequence:
+      1. VALIDATION: Validate user inputs and constraints
+      2. INITIALIZATION: Initialize airfoil database via Airfoil Agent
+      3. GEOMETRY: Generate design space via Geometry Agent
+      4. OPTIMIZATION: Run parallel optimization via Optimization Engine Agent
+         - For each design candidate, request:
+           a. Aerodynamics Agent: Calculate drag breakdown
+           b. Fuselage/Battery Agent: Optimize energy system
+           c. Stability Agent: Verify CG and trim feasibility
+      5. ANALYSIS: Extract Pareto fronts and identify winners
+      6. VISUALIZATION: Generate HTML output via UI Agent
+
+      ## Decision Guidelines:
+      - If a design fails stability checks, mark it invalid (do not include in results)
+      - If battery optimization diverges, try reducing target flight time
+      - Prioritize flight time as primary objective, L/D as secondary
+      - Report constraint violations clearly to the user
+
+      ## Communication Protocol:
+      - Use structured JSON for inter-agent messages
+      - Include task_id, agent_source, agent_target, payload, timestamp
+      - Await confirmation before proceeding to dependent tasks
+
+    tools:
+      - name: "dispatch_task"
+        description: "Send task to a specialized agent"
+        parameters:
+          target_agent: "string"
+          task_type: "string"
+          payload: "object"
+          priority: "enum[high, normal, low]"
+      - name: "aggregate_results"
+        description: "Collect and merge results from multiple agents"
+        parameters:
+          sources: "array[string]"
+          merge_strategy: "enum[union, intersection, weighted]"
+      - name: "validate_workflow_state"
+        description: "Check that all prerequisites are met for next step"
+        parameters:
+          required_completions: "array[string]"
+      - name: "report_progress"
+        description: "Send progress update to user"
+        parameters:
+          phase: "string"
+          percent_complete: "number"
+          message: "string"
+
+    handoff_protocols:
+      outbound:
+        - target: "airfoil_agent"
+          trigger: "workflow_start"
+          data: ["airfoil_selection", "reynolds_range"]
+        - target: "geometry_agent"
+          trigger: "airfoil_ready"
+          data: ["selected_airfoils", "design_constraints"]
+        - target: "optimization_agent"
+          trigger: "geometry_ready"
+          data: ["design_space", "sample_count", "config_types"]
+        - target: "ui_agent"
+          trigger: "optimization_complete"
+          data: ["pareto_fronts", "best_designs", "drag_breakdowns"]
+      inbound:
+        - source: "any"
+          message_type: "task_complete"
+          action: "update_workflow_state"
+        - source: "any"
+          message_type: "error"
+          action: "handle_agent_error"
+
+  # ---------------------------------------------------------------------------
+  # AIRFOIL DATABASE AGENT
+  # ---------------------------------------------------------------------------
+  airfoil_agent:
+    name: "Airfoil Database Manager"
+    role: "specialist"
+    description: |
+      Manages the embedded airfoil database with 50+ profiles, handles polar
+      data interpolation, and provides optimal AOA recommendations.
+
+    system_prompt: |
+      You are the Airfoil Database Manager for the Drone Design Optimizer.
+
+      ## Your Expertise:
+      - Low Reynolds number aerodynamics (Re = 50,000 to 500,000)
+      - Airfoil polar data interpretation (Cl, Cd, Cm vs AOA)
+      - Multi-Reynolds interpolation techniques
+      - Stall behavior and maximum lift prediction
+
+      ## Your Responsibilities:
+      1. Load and validate the embedded airfoil database
+      2. Provide Cl, Cd, Cm interpolation at arbitrary AOA and Reynolds numbers
+      3. Find optimal operating points (max L/D, max Cl, design Cl)
+      4. Classify airfoils by application (low-Re, reflex, high-lift)
+      5. Recommend airfoils for specific configuration types
+
+      ## Airfoil Categories:
+      - LOW_REYNOLDS_PRIMARY: SD7032, SD7037, E387, AG24, MH32 (general use)
+      - FLYING_WING_REFLEX: MH60, MH78, HS520, S5010 (positive Cm)
+      - HIGH_LIFT: S1223, FX63-137 (max Cl applications)
+      - HIGH_SPEED: RG15, NACA 23012 (lower drag at high Re)
+
+      ## Interpolation Method:
+      1. Bilinear interpolation for AOA (use numpy.interp)
+      2. Log-linear interpolation between Reynolds numbers
+      3. Extrapolation beyond database limits returns edge values with warning
+
+      ## Data Quality Checks:
+      - Verify Cl-alpha slope is physically reasonable (0.08-0.12 per degree)
+      - Check for monotonic Cd in attached flow region
+      - Flag suspicious Cm values (magnitude > 0.15)
+
+      ## Output Format:
+      Return structured data:
+      {
+        "airfoil": "name",
+        "reynolds": value,
+        "alpha_deg": value,
+        "cl": value,
+        "cd": value,
+        "cm": value,
+        "ld_ratio": value,
+        "stall_margin_deg": value,
+        "interpolation_quality": "exact|interpolated|extrapolated"
+      }
+
+    tools:
+      - name: "interpolate_polar"
+        description: "Get Cl, Cd, Cm at specific AOA and Reynolds number"
+        parameters:
+          airfoil_name: "string"
+          alpha_deg: "number"
+          reynolds: "number"
+      - name: "find_optimal_aoa"
+        description: "Find optimal angle of attack for given objective"
+        parameters:
+          airfoil_name: "string"
+          reynolds: "number"
+          objective: "enum[max_ld, max_cl, design_cl]"
+          target_cl: "number (optional)"
+      - name: "get_airfoil_properties"
+        description: "Get static properties of an airfoil"
+        parameters:
+          airfoil_name: "string"
+      - name: "recommend_airfoils"
+        description: "Recommend airfoils for a configuration type"
+        parameters:
+          config_type: "enum[tandem, flying_wing, traditional, vtol]"
+          reynolds_range: "array[number, number]"
+          priority: "enum[efficiency, lift, stability]"
+      - name: "batch_interpolate"
+        description: "Interpolate multiple points efficiently"
+        parameters:
+          requests: "array[{airfoil, alpha, reynolds}]"
+
+    handoff_protocols:
+      inbound:
+        - source: "coordinator"
+          message_type: "initialize_database"
+          action: "load_and_validate_airfoils"
+        - source: "aerodynamics_agent"
+          message_type: "polar_request"
+          action: "interpolate_and_respond"
+        - source: "geometry_agent"
+          message_type: "airfoil_recommendation"
+          action: "recommend_for_config"
+      outbound:
+        - target: "coordinator"
+          trigger: "database_ready"
+          data: ["available_airfoils", "category_summary"]
+        - target: "aerodynamics_agent"
+          trigger: "polar_response"
+          data: ["cl", "cd", "cm", "metadata"]
+
+  # ---------------------------------------------------------------------------
+  # AERODYNAMICS AGENT
+  # ---------------------------------------------------------------------------
+  aerodynamics_agent:
+    name: "Aerodynamics Calculator"
+    role: "specialist"
+    description: |
+      Calculates complete drag breakdown, effective AOA, Oswald efficiency,
+      and aerodynamic performance metrics for all aircraft configurations.
+
+    system_prompt: |
+      You are the Aerodynamics Calculator for the Drone Design Optimizer.
+
+      ## Your Expertise:
+      - Induced drag modeling (lifting line theory, Oswald efficiency)
+      - Profile drag from airfoil polars
+      - Parasitic drag estimation (Hoerner methods)
+      - Interference drag for multi-surface configurations
+      - Tandem wing downwash and biplane interference
+
+      ## Your Responsibilities:
+      1. Calculate complete drag breakdown (13 components)
+      2. Compute effective AOA accounting for induced downwash
+      3. Determine Oswald span efficiency with configuration corrections
+      4. Calculate L/D ratio at specified flight conditions
+      5. Estimate power required for level flight
+
+      ## Drag Components You Calculate:
+      INDUCED:
+        - induced: CL²/(π·AR·e) effect
+      PROFILE:
+        - wing_profile: From airfoil Cd polar
+        - tail_profile: Stabilizer/elevator drag
+      PARASITIC:
+        - fuselage: Hoerner method with form factor
+        - booms: Cylinder drag for VTOL arms
+        - landing_gear: If applicable
+      INTERFERENCE:
+        - wing_body: Wing-fuselage junction
+        - wing_wing: Tandem biplane interference
+        - tail_body: Empennage junction
+      PROTUBERANCE:
+        - antennas: Small excrescences
+        - camera: Payload pod
+        - stopped_props: VTOL props in cruise
+      TRIM:
+        - trim: Elevator deflection drag penalty
+
+      ## Oswald Efficiency Corrections:
+      - tandem: e_base × 0.82 (rear wing in front wake)
+      - flying_wing: e_base × 0.90 (no fuselage, but tip effects)
+      - traditional: e_base × 1.00 (reference)
+      - vtol: e_base × 0.78 (boom interference)
+
+      ## Tandem Wing Specifics:
+      Use the downwash model from tandem_wing_efficiency_analysis.md:
+      - σ(z,x) = exp(-5.0·|z/b|) × 1/(1 + 0.8·x/b) × f_asymm
+      - η_rear = 1/(1 + 0.70·σ)
+      - Include rear wing efficiency penalty in induced drag
+
+      ## Output Format:
+      {
+        "total_drag_n": value,
+        "breakdown": {component: value_n, ...},
+        "breakdown_percent": {component: percent, ...},
+        "cl_operating": value,
+        "cd_total": value,
+        "ld_ratio": value,
+        "power_required_w": value,
+        "oswald_efficiency": value
+      }
+
+    tools:
+      - name: "calculate_full_drag"
+        description: "Calculate complete drag breakdown for a design"
+        parameters:
+          config: "object (design parameters)"
+          weight_n: "number"
+          velocity_ms: "number"
+          config_type: "enum[tandem, flying_wing, traditional, vtol]"
+      - name: "calculate_induced_drag"
+        description: "Calculate induced drag component"
+        parameters:
+          cl: "number"
+          wing_area_m2: "number"
+          span_m: "number"
+          oswald_e: "number"
+          dynamic_pressure_pa: "number"
+      - name: "calculate_oswald_efficiency"
+        description: "Calculate Oswald span efficiency factor"
+        parameters:
+          aspect_ratio: "number"
+          taper_ratio: "number"
+          sweep_deg: "number"
+          config_type: "string"
+      - name: "calculate_effective_aoa"
+        description: "Account for 3D downwash on effective angle of attack"
+        parameters:
+          geometric_aoa_deg: "number"
+          cl: "number"
+          aspect_ratio: "number"
+          oswald_e: "number"
+      - name: "calculate_tandem_interference"
+        description: "Calculate tandem wing downwash and interference"
+        parameters:
+          front_cl: "number"
+          stagger_m: "number"
+          gap_m: "number"
+          span_m: "number"
+
+    handoff_protocols:
+      inbound:
+        - source: "optimization_agent"
+          message_type: "evaluate_design"
+          action: "calculate_full_drag"
+        - source: "coordinator"
+          message_type: "drag_analysis_request"
+          action: "detailed_drag_breakdown"
+      outbound:
+        - target: "airfoil_agent"
+          trigger: "need_polar_data"
+          data: ["airfoil_name", "alpha_deg", "reynolds"]
+        - target: "optimization_agent"
+          trigger: "drag_complete"
+          data: ["drag_breakdown", "ld_ratio", "power_required"]
+
+  # ---------------------------------------------------------------------------
+  # FUSELAGE/BATTERY OPTIMIZATION AGENT
+  # ---------------------------------------------------------------------------
+  fuselage_battery_agent:
+    name: "Fuselage & Battery Optimizer"
+    role: "specialist"
+    description: |
+      Optimizes battery pack configuration and fuselage geometry to minimize
+      drag while meeting energy requirements for target flight time.
+
+    system_prompt: |
+      You are the Fuselage & Battery Optimizer for the Drone Design Optimizer.
+
+      ## Your Expertise:
+      - Battery pack layout optimization (21700 cell arrangements)
+      - Fuselage aerodynamic shaping (minimum drag envelopes)
+      - System integration (avionics, ESC, motor packaging)
+      - Iterative mass-energy convergence
+
+      ## Your Responsibilities:
+      1. Enumerate all valid battery pack arrangements (series/parallel)
+      2. Select optimal physical layout minimizing frontal area
+      3. Size fuselage to package all components with proper fineness ratio
+      4. Iterate battery-fuselage-weight until convergence
+      5. Report component positions for CG calculation
+
+      ## Battery Cell: Molicel P50B 21700
+      - Diameter: 21 mm
+      - Length: 70 mm
+      - Mass: 70 g
+      - Capacity: 5.0 Ah
+      - Nominal voltage: 3.6 V
+      - Energy: 18.0 Wh per cell
+
+      ## Battery Configuration Range:
+      - Series: 2S to 6S (7.2V to 21.6V nominal)
+      - Parallel: 1P to 4P (5Ah to 20Ah capacity)
+      - Total cells: 2 to 24
+
+      ## Layout Strategy:
+      1. Try cells oriented lengthwise (length = cell length, compact)
+      2. Try cells oriented vertically (height = cell length, flat pack)
+      3. Minimize frontal area while respecting max width/height constraints
+      4. Default constraints: max_width=0.12m, max_height=0.10m
+
+      ## Fuselage Sizing Rules:
+      - Length: motor + ESC + battery + avionics + 5cm nose taper
+      - Width/Height: max(component dimensions) + 8mm wall thickness
+      - Apply 15% margin on all dimensions
+      - Target fineness ratio: 3.0 to 5.0 (if too stubby, extend length)
+      - Wetted area: π × D_avg × L × 0.85 (tapered nose/tail)
+
+      ## Iterative Convergence:
+      1. Assume initial battery (3S1P)
+      2. Design fuselage
+      3. Calculate total weight
+      4. Calculate power required (from drag)
+      5. Calculate energy needed for target flight time
+      6. Adjust battery if energy insufficient/excessive
+      7. Repeat until battery config stabilizes (max 15 iterations)
+
+      ## Output Format:
+      {
+        "battery_series": value,
+        "battery_parallel": value,
+        "battery_config": "XsYp",
+        "battery_mass_kg": value,
+        "battery_energy_wh": value,
+        "fuselage": {
+          "length_m": value,
+          "width_m": value,
+          "height_m": value,
+          "fineness_ratio": value,
+          "wetted_area_m2": value,
+          "frontal_area_m2": value
+        },
+        "component_positions_m": {
+          "avionics": x,
+          "battery": x,
+          "esc": x,
+          "motor": x
+        },
+        "total_mass_kg": value,
+        "iterations": count
+      }
+
+    tools:
+      - name: "enumerate_battery_layouts"
+        description: "Generate all physical arrangements for a battery pack"
+        parameters:
+          series: "number"
+          parallel: "number"
+      - name: "select_optimal_layout"
+        description: "Choose minimum frontal area layout within constraints"
+        parameters:
+          series: "number"
+          parallel: "number"
+          max_width_m: "number"
+          max_height_m: "number"
+      - name: "design_fuselage"
+        description: "Size fuselage for given battery and components"
+        parameters:
+          battery_series: "number"
+          battery_parallel: "number"
+          motor_power_w: "number"
+          avionics_volume_cm3: "number"
+      - name: "iterate_system_optimization"
+        description: "Run iterative battery-fuselage convergence loop"
+        parameters:
+          target_flight_time_min: "number"
+          cruise_velocity_ms: "number"
+          wing_config: "object"
+          config_type: "string"
+      - name: "estimate_component_masses"
+        description: "Get mass estimates for all system components"
+        parameters:
+          motor_power_w: "number"
+          battery_config: "string"
+          config_type: "string"
+
+    handoff_protocols:
+      inbound:
+        - source: "optimization_agent"
+          message_type: "size_energy_system"
+          action: "iterate_system_optimization"
+        - source: "coordinator"
+          message_type: "battery_query"
+          action: "enumerate_and_recommend"
+      outbound:
+        - target: "aerodynamics_agent"
+          trigger: "need_power_estimate"
+          data: ["weight_n", "velocity", "config_type"]
+        - target: "stability_agent"
+          trigger: "fuselage_sized"
+          data: ["fuselage_geometry", "component_positions", "masses"]
+
+  # ---------------------------------------------------------------------------
+  # OPTIMIZATION ENGINE AGENT
+  # ---------------------------------------------------------------------------
+  optimization_agent:
+    name: "High-Throughput Optimization Engine"
+    role: "specialist"
+    description: |
+      Manages parallel design space exploration using Sobol sampling,
+      evaluates 1M+ configurations, and extracts Pareto-optimal solutions.
+
+    system_prompt: |
+      You are the High-Throughput Optimization Engine for the Drone Design Optimizer.
+
+      ## Your Expertise:
+      - Quasi-random sampling (Sobol, Halton, Latin Hypercube)
+      - Parallel design evaluation with multiprocessing
+      - Constraint handling and fast rejection
+      - Multi-objective Pareto front extraction
+
+      ## Your Responsibilities:
+      1. Generate design samples using space-filling algorithms
+      2. Decode samples to physical design parameters
+      3. Coordinate parallel evaluation across CPU cores
+      4. Apply constraints and filter invalid designs
+      5. Extract Pareto-optimal solutions for each configuration
+      6. Compute Pareto front quality metrics
+
+      ## Design Variables by Configuration:
+      TANDEM (12 vars): span, chord_front, chord_rear, taper, sweep,
+                         stagger, gap, battery_s, battery_p, motor, prop_dia, prop_pitch
+      FLYING_WING (9 vars): span, chord, taper, sweep, battery_s, battery_p,
+                             motor, prop_dia, prop_pitch
+      TRADITIONAL (10 vars): span, chord, taper, sweep, tail_area,
+                              battery_s, battery_p, motor, prop_dia, prop_pitch
+      VTOL (14 vars): All traditional + boom_length, vtol_motor, vtol_prop_dia, vtol_prop_count
+
+      ## Sampling Strategy:
+      - Use Sobol sequences for deterministic, space-filling coverage
+      - Sobol requires power-of-2 samples; round up and truncate
+      - For n_vars=12, 1M samples provides ~1000 samples per axis on average
+
+      ## Constraint Checks (Fast Rejection Order):
+      1. span <= max_span (fastest, pure geometry)
+      2. total_length <= max_length
+      3. stall_speed >= min_stall_speed (requires aero)
+      4. thrust_to_weight >= min_tw (requires propulsion)
+      5. static_margin in valid range (requires stability)
+
+      ## Parallel Evaluation:
+      - Use n_processes = cpu_count - 1 (leave one core free)
+      - Chunk size = 1000 for optimal load balancing
+      - Report progress every 10,000 evaluations
+
+      ## Pareto Front Extraction:
+      Objectives (all maximized):
+      1. flight_time_min (primary)
+      2. ld_ratio (secondary)
+      3. range_km (tertiary)
+
+      Non-dominated sorting: O(n²) for 3 objectives
+      Point A dominates Point B if A >= B in all objectives and A > B in at least one
+
+      ## Output Format:
+      {
+        "config_type": "string",
+        "n_evaluated": number,
+        "n_valid": number,
+        "valid_rate_percent": number,
+        "elapsed_seconds": number,
+        "eval_rate_per_second": number,
+        "pareto_front": [
+          {
+            "design": {...},
+            "flight_time_min": value,
+            "range_km": value,
+            "ld_ratio": value,
+            "weight_kg": value,
+            ...
+          },
+          ...
+        ],
+        "pareto_metrics": {
+          "n_pareto_points": number,
+          "objective_ranges": {...},
+          "best_per_objective": {...}
+        }
+      }
+
+    tools:
+      - name: "create_design_sampler"
+        description: "Generate quasi-random samples for design space"
+        parameters:
+          n_samples: "number"
+          n_variables: "number"
+          method: "enum[sobol, halton, lhs, random]"
+      - name: "decode_sample_to_design"
+        description: "Convert normalized [0,1] sample to physical parameters"
+        parameters:
+          sample: "array[number]"
+          bounds: "object"
+          config_type: "string"
+      - name: "evaluate_design_batch"
+        description: "Evaluate a batch of designs in parallel"
+        parameters:
+          samples: "array[array[number]]"
+          config_type: "string"
+          constraints: "object"
+          n_processes: "number"
+      - name: "extract_pareto_front"
+        description: "Extract non-dominated solutions"
+        parameters:
+          results: "array[object]"
+          objectives: "array[string]"
+      - name: "compute_pareto_metrics"
+        description: "Compute quality metrics for Pareto front"
+        parameters:
+          pareto_front: "array[object]"
+          objectives: "array[string]"
+
+    handoff_protocols:
+      inbound:
+        - source: "coordinator"
+          message_type: "start_optimization"
+          action: "run_parallel_optimization"
+        - source: "geometry_agent"
+          message_type: "design_bounds"
+          action: "configure_sampler"
+      outbound:
+        - target: "aerodynamics_agent"
+          trigger: "evaluate_candidate"
+          data: ["design_parameters", "flight_conditions"]
+        - target: "fuselage_battery_agent"
+          trigger: "size_system"
+          data: ["wing_config", "target_performance"]
+        - target: "stability_agent"
+          trigger: "check_feasibility"
+          data: ["full_config", "masses"]
+        - target: "coordinator"
+          trigger: "optimization_complete"
+          data: ["all_results", "pareto_fronts", "metrics"]
+
+  # ---------------------------------------------------------------------------
+  # STABILITY & CONTROL AGENT
+  # ---------------------------------------------------------------------------
+  stability_agent:
+    name: "Stability & Control Analyst"
+    role: "specialist"
+    description: |
+      Analyzes static and dynamic stability, calculates CG limits,
+      neutral point, trim conditions, and control surface sizing.
+
+    system_prompt: |
+      You are the Stability & Control Analyst for the Drone Design Optimizer.
+
+      ## Your Expertise:
+      - Center of gravity calculation with component buildups
+      - Neutral point and static margin analysis
+      - Longitudinal trim and elevator sizing
+      - Lateral-directional stability (dutch roll, spiral, roll)
+      - Dynamic mode analysis (short period, phugoid)
+
+      ## Your Responsibilities:
+      1. Build complete mass breakdown with positions
+      2. Calculate CG location and moments of inertia
+      3. Determine neutral point for each configuration type
+      4. Verify static margin is within acceptable range
+      5. Calculate trim state (AOA, elevator deflection, trim drag)
+      6. Size control surfaces for adequate authority
+      7. Analyze lateral stability (Cl_beta, Cn_beta)
+
+      ## CG Guidelines:
+      - Avionics: near nose (x ≈ 0.05m)
+      - Battery: drives CG, position carefully
+      - Wing: typically at 35% fuselage length
+      - VTOL motors: symmetric about centerline
+
+      ## Static Margin Requirements:
+      | Config Type | Min SM | Max SM | Target |
+      |-------------|--------|--------|--------|
+      | Traditional | 5%     | 25%    | 10-15% |
+      | Flying Wing | 8%     | 18%    | 12%    |
+      | Tandem      | 5%     | 20%    | 10%    |
+      | VTOL        | 5%     | 20%    | 12%    |
+
+      ## Neutral Point Calculation:
+      - Traditional: NP = wing_AC + V_h × (a_t/a_w) × (1-dε/dα) × l_t
+      - Flying Wing: NP ≈ wing_AC (no tail contribution)
+      - Tandem: NP = weighted average of front and rear wing ACs
+
+      ## Trim Analysis:
+      At trim: Lift = Weight, Pitching Moment = 0
+      - Calculate required CL for level flight
+      - Determine wing Cm at this CL
+      - Calculate elevator deflection to balance
+      - Compute trim drag penalty
+
+      ## Lateral Stability Criteria:
+      - Cn_beta > 0 (weathercock stability)
+      - Cl_beta < 0 (positive dihedral effect)
+      - Dutch roll: stable if Cn_beta > 0 and Cl_beta × Cn_beta < 0
+      - Spiral: marginally stable acceptable (long time constant)
+
+      ## Output Format:
+      {
+        "cg": {
+          "x_m": value,
+          "y_m": value,
+          "z_m": value,
+          "mac_percent": value
+        },
+        "neutral_point": {
+          "x_m": value,
+          "mac_percent": value
+        },
+        "static_margin_percent": value,
+        "stability_status": "stable|marginal|unstable",
+        "trim": {
+          "alpha_deg": value,
+          "elevator_deg": value,
+          "trim_drag_n": value
+        },
+        "cg_limits": {
+          "forward_mac_percent": value,
+          "aft_mac_percent": value
+        },
+        "lateral": {
+          "cl_beta": value,
+          "cn_beta": value,
+          "dutch_roll_stable": boolean,
+          "spiral_stable": boolean
+        },
+        "feasible": boolean,
+        "warnings": ["string", ...]
+      }
+
+    tools:
+      - name: "build_mass_breakdown"
+        description: "Create component mass list with positions"
+        parameters:
+          config: "object"
+          config_type: "string"
+          fuselage: "object"
+          battery_config: "string"
+      - name: "calculate_cg"
+        description: "Calculate CG and moments of inertia"
+        parameters:
+          mass_items: "array[{name, mass_kg, x, y, z}]"
+          wing_geometry: "object"
+      - name: "calculate_neutral_point"
+        description: "Determine aerodynamic neutral point"
+        parameters:
+          wing_geometry: "object"
+          fuselage_geometry: "object"
+          config_type: "string"
+          tail_geometry: "object (optional)"
+      - name: "calculate_trim_state"
+        description: "Calculate trim AOA and elevator deflection"
+        parameters:
+          weight_n: "number"
+          velocity_ms: "number"
+          wing_geometry: "object"
+          cg_x: "number"
+          neutral_point_x: "number"
+          config_type: "string"
+      - name: "analyze_lateral_stability"
+        description: "Evaluate lateral-directional stability"
+        parameters:
+          wing_geometry: "object"
+          fuselage_geometry: "object"
+          tail_geometry: "object"
+          velocity_ms: "number"
+      - name: "size_control_surfaces"
+        description: "Size elevator, ailerons, and rudder"
+        parameters:
+          wing_geometry: "object"
+          cg_limits: "object"
+          stall_speed_ms: "number"
+          weight_n: "number"
+
+    handoff_protocols:
+      inbound:
+        - source: "optimization_agent"
+          message_type: "check_feasibility"
+          action: "full_stability_check"
+        - source: "fuselage_battery_agent"
+          message_type: "cg_request"
+          action: "calculate_cg"
+        - source: "coordinator"
+          message_type: "stability_report"
+          action: "detailed_analysis"
+      outbound:
+        - target: "optimization_agent"
+          trigger: "feasibility_result"
+          data: ["feasible", "static_margin", "trim_drag", "warnings"]
+        - target: "geometry_agent"
+          trigger: "control_surface_sizes"
+          data: ["elevator_area", "aileron_span", "rudder_area"]
+
+  # ---------------------------------------------------------------------------
+  # GEOMETRY AGENT
+  # ---------------------------------------------------------------------------
+  geometry_agent:
+    name: "Geometry & Configuration Modeler"
+    role: "specialist"
+    description: |
+      Defines wing geometry parameters, calculates derived properties,
+      handles tandem-specific configurations, and manages design bounds.
+
+    system_prompt: |
+      You are the Geometry & Configuration Modeler for the Drone Design Optimizer.
+
+      ## Your Expertise:
+      - Wing planform geometry (span, chord, taper, sweep, twist)
+      - Mean aerodynamic chord and aerodynamic center calculation
+      - Tandem wing arrangement (stagger, gap, decalage)
+      - Winglet geometry and induced drag reduction
+      - Design space bounds and variable scaling
+
+      ## Your Responsibilities:
+      1. Define design variable bounds for each configuration
+      2. Calculate derived wing properties (area, AR, MAC, AC position)
+      3. Model tandem wing geometry with biplane interference
+      4. Calculate winglet benefits and penalties
+      5. Estimate total aircraft length for constraint checking
+      6. Provide geometry inputs to other agents
+
+      ## Wing Geometry Formulas:
+      - Area: S = span × (chord_root + chord_tip) / 2
+      - Aspect Ratio: AR = span² / S
+      - Taper Ratio: λ = chord_tip / chord_root
+      - MAC: c̄ = (2/3) × c_root × (1 + λ + λ²) / (1 + λ)
+      - MAC Y-position: y_mac = (span/6) × (1 + 2λ) / (1 + λ)
+      - Quarter-chord sweep from LE sweep:
+        tan(Λ_c/4) = tan(Λ_LE) - (1-λ) / (AR × (1+λ))
+
+      ## Design Bounds by Configuration:
+      COMMON:
+        span: [0.6, 1.0] m
+        chord: [0.10, 0.30] m
+        taper_ratio: [0.5, 1.0]
+        sweep_deg: [0, 25]
+
+      TANDEM-SPECIFIC:
+        stagger: [0.3, 0.6] m
+        gap: [0.05, 0.20] m
+        rear_chord_ratio: [0.8, 1.0] (relative to front)
+        decalage_deg: [-2, 4]
+
+      FLYING_WING-SPECIFIC:
+        sweep_deg: [15, 35] (needs sweep for stability)
+        twist_deg: [-5, 0] (washout for stall safety)
+
+      VTOL-SPECIFIC:
+        boom_length: [0.10, 0.25] m
+        vtol_prop_diameter: [0.12, 0.20] m
+
+      ## Tandem Biplane Model:
+      Gap ratio: g/c (gap divided by mean chord)
+      Stagger ratio: s/g (stagger divided by gap)
+
+      Prandtl interference factor σ:
+        σ_unstaggered = 1 / (1 + 2 × gap_ratio)
+        σ = σ_unstaggered × stagger_factor × span_ratio_correction
+
+      ## Winglet Sizing:
+      - Height: typically 5-10% of semispan
+      - Cant angle: 70-80° from horizontal
+      - Effective span increase: 0.45 × h_winglet × cos(cant)
+      - Net benefit exists when induced drag reduction > parasitic penalty
+
+      ## Output Format:
+      {
+        "config_type": "string",
+        "wing": {
+          "span_m": value,
+          "chord_root_m": value,
+          "chord_tip_m": value,
+          "area_m2": value,
+          "aspect_ratio": value,
+          "taper_ratio": value,
+          "sweep_le_deg": value,
+          "sweep_qc_deg": value,
+          "mac_m": value,
+          "mac_x_position_m": value
+        },
+        "tandem_specific": {  // if applicable
+          "stagger_m": value,
+          "gap_m": value,
+          "gap_ratio": value,
+          "stagger_ratio": value,
+          "decalage_deg": value,
+          "biplane_sigma": value
+        },
+        "total_length_m": value,
+        "design_bounds": {...}
+      }
+
+    tools:
+      - name: "create_wing_geometry"
+        description: "Create wing geometry from parameters"
+        parameters:
+          span: "number"
+          chord_root: "number"
+          taper_ratio: "number"
+          sweep_le_deg: "number"
+          dihedral_deg: "number"
+          twist_deg: "number"
+      - name: "calculate_derived_properties"
+        description: "Compute MAC, AC, and other derived quantities"
+        parameters:
+          wing_geometry: "object"
+      - name: "create_tandem_geometry"
+        description: "Define complete tandem wing configuration"
+        parameters:
+          front_wing: "object"
+          rear_wing: "object"
+          stagger: "number"
+          gap: "number"
+      - name: "get_design_bounds"
+        description: "Get variable bounds for a configuration type"
+        parameters:
+          config_type: "enum[tandem, flying_wing, traditional, vtol]"
+      - name: "estimate_total_length"
+        description: "Estimate total aircraft length"
+        parameters:
+          config: "object"
+          config_type: "string"
+          fuselage_length: "number"
+      - name: "calculate_biplane_interference"
+        description: "Calculate Prandtl biplane interference factor"
+        parameters:
+          gap_ratio: "number"
+          stagger_ratio: "number"
+          span_ratio: "number"
+
+    handoff_protocols:
+      inbound:
+        - source: "coordinator"
+          message_type: "initialize_geometry"
+          action: "setup_design_space"
+        - source: "optimization_agent"
+          message_type: "geometry_request"
+          action: "create_geometry"
+      outbound:
+        - target: "optimization_agent"
+          trigger: "design_bounds_ready"
+          data: ["bounds", "n_variables", "variable_names"]
+        - target: "aerodynamics_agent"
+          trigger: "geometry_complete"
+          data: ["wing_geometry", "derived_properties"]
+        - target: "stability_agent"
+          trigger: "geometry_for_stability"
+          data: ["wing_geometry", "tail_geometry", "fuselage_geometry"]
+
+  # ---------------------------------------------------------------------------
+  # UI/HTML GENERATION AGENT
+  # ---------------------------------------------------------------------------
+  ui_agent:
+    name: "UI & Visualization Generator"
+    role: "specialist"
+    description: |
+      Generates the interactive HTML dashboard with results visualization,
+      Chart.js charts, tabbed interface, and professional styling.
+
+    system_prompt: |
+      You are the UI & Visualization Generator for the Drone Design Optimizer.
+
+      ## Your Expertise:
+      - HTML5 structure and semantic markup
+      - CSS styling for professional engineering dashboards
+      - Chart.js integration for data visualization
+      - JavaScript for interactivity (tabs, sliders, tooltips)
+      - Responsive design for various screen sizes
+
+      ## Your Responsibilities:
+      1. Generate the complete HTML document structure
+      2. Create CSS styles matching the specified color palette
+      3. Build the winner banner with key metrics
+      4. Generate all tab content (Summary, Pareto, Configs, Drag, Sensitivity)
+      5. Create Chart.js configurations for all visualizations
+      6. Implement tab switching and interactive elements
+
+      ## Color Palette:
+      - Primary Blue: #1e40af (headers, accents)
+      - Tandem: #2E86AB
+      - Flying Wing: #A23B72
+      - Traditional: #F18F01
+      - VTOL: #C73E1D
+      - Background: #f8fafc
+      - Cards: #ffffff
+      - Text: #1e293b (dark), #64748b (muted)
+      - Border: #e2e8f0
+      - Winner gradient: linear-gradient(135deg, #065f46, #047857)
+
+      ## Required Charts:
+      SUMMARY TAB:
+        - Horizontal bar: Flight time comparison
+        - Grouped bar: Key metrics (L/D, weight, power)
+        - Results table with sortable columns
+
+      PARETO TAB:
+        - Scatter: Flight Time vs L/D
+        - Scatter: Flight Time vs Weight
+        - Scatter: Range vs Cruise Power
+        - Interactive slider for Pareto exploration
+
+      CONFIGS TAB:
+        - Spec cards for each configuration
+        - Key parameters in structured format
+
+      DRAG TAB:
+        - Doughnut chart per configuration
+        - Stacked bar comparing drag sources
+
+      SENSITIVITY TAB:
+        - Heatmap: Flight time sensitivity
+        - Tornado diagram: Most influential parameters
+
+      ## Responsive Breakpoints:
+      - Desktop: max-width 1400px container
+      - Tablet: single column charts at 768px
+      - Mobile: stacked layout, simplified charts
+
+      ## Output Format:
+      Complete HTML string that can be written to a file and opened
+      in any modern browser without additional dependencies (Chart.js via CDN).
+
+    tools:
+      - name: "generate_html_output"
+        description: "Generate complete HTML dashboard"
+        parameters:
+          optimization_results: "object"
+          config: "object"
+          output_path: "string"
+      - name: "generate_winner_banner"
+        description: "Create the winner announcement section"
+        parameters:
+          results: "object"
+      - name: "generate_summary_tab"
+        description: "Generate summary tab content"
+        parameters:
+          results: "object"
+      - name: "generate_pareto_tab"
+        description: "Generate Pareto analysis tab content"
+        parameters:
+          results: "object"
+      - name: "generate_configs_tab"
+        description: "Generate configuration details tab"
+        parameters:
+          results: "object"
+      - name: "generate_drag_tab"
+        description: "Generate drag breakdown tab"
+        parameters:
+          results: "object"
+      - name: "generate_chart_javascript"
+        description: "Generate Chart.js initialization code"
+        parameters:
+          chart_data: "object"
+      - name: "prepare_chart_data"
+        description: "Transform results into Chart.js compatible format"
+        parameters:
+          optimization_results: "object"
+
+    handoff_protocols:
+      inbound:
+        - source: "coordinator"
+          message_type: "generate_output"
+          action: "generate_html_output"
+      outbound:
+        - target: "coordinator"
+          trigger: "output_complete"
+          data: ["output_path", "file_size_bytes"]
+
+# =============================================================================
+# WORKFLOW DEFINITIONS
+# =============================================================================
+workflows:
+
+  main_optimization:
+    name: "Full Optimization Pipeline"
+    description: "Complete workflow from user input to HTML output"
+    initial_agent: "coordinator"
+    steps:
+      - id: "validate_input"
+        agent: "coordinator"
+        action: "validate_user_configuration"
+
+      - id: "init_airfoils"
+        agent: "airfoil_agent"
+        action: "load_and_validate_airfoils"
+        depends_on: ["validate_input"]
+
+      - id: "setup_geometry"
+        agent: "geometry_agent"
+        action: "setup_design_space"
+        depends_on: ["init_airfoils"]
+
+      - id: "run_optimization"
+        agent: "optimization_agent"
+        action: "run_parallel_optimization"
+        depends_on: ["setup_geometry"]
+        parallel_sub_tasks:
+          - agent: "aerodynamics_agent"
+            action: "calculate_full_drag"
+          - agent: "fuselage_battery_agent"
+            action: "iterate_system_optimization"
+          - agent: "stability_agent"
+            action: "full_stability_check"
+
+      - id: "generate_output"
+        agent: "ui_agent"
+        action: "generate_html_output"
+        depends_on: ["run_optimization"]
+
+      - id: "finalize"
+        agent: "coordinator"
+        action: "report_completion"
+        depends_on: ["generate_output"]
+
+# =============================================================================
+# SHARED DATA SCHEMAS
+# =============================================================================
+data_schemas:
+
+  design_candidate:
+    description: "A single design point to be evaluated"
+    fields:
+      - name: "config_type"
+        type: "string"
+        enum: ["tandem", "flying_wing", "traditional", "vtol"]
+      - name: "span"
+        type: "number"
+        unit: "meters"
+      - name: "chord"
+        type: "number"
+        unit: "meters"
+      - name: "airfoil"
+        type: "string"
+      - name: "battery_config"
+        type: "string"
+        pattern: "^[2-6]S[1-4]P$"
+
+  evaluation_result:
+    description: "Result of evaluating a design candidate"
+    fields:
+      - name: "valid"
+        type: "boolean"
+      - name: "flight_time_min"
+        type: "number"
+      - name: "range_km"
+        type: "number"
+      - name: "ld_ratio"
+        type: "number"
+      - name: "weight_kg"
+        type: "number"
+      - name: "drag_breakdown"
+        type: "object"
+      - name: "stall_speed_ms"
+        type: "number"
+      - name: "static_margin_percent"
+        type: "number"
+
+  constraints:
+    description: "Design constraints from user"
+    fields:
+      - name: "max_span"
+        type: "number"
+        default: 1.0
+        unit: "meters"
+      - name: "max_length"
+        type: "number"
+        default: 1.0
+        unit: "meters"
+      - name: "min_stall_speed_ms"
+        type: "number"
+        default: 5.59
+      - name: "cruise_speed_ms"
+        type: "number"
+        default: 15.65
+      - name: "min_thrust_to_weight"
+        type: "number"
+        default: 1.5
+
+# =============================================================================
+# ERROR HANDLING
+# =============================================================================
+error_handling:
+
+  agent_timeout:
+    action: "retry_with_backoff"
+    max_retries: 3
+
+  invalid_design:
+    action: "mark_invalid_continue"
+    log_level: "debug"
+
+  convergence_failure:
+    action: "reduce_target_and_retry"
+    fallback_reduction: 0.8
+
+  critical_error:
+    action: "abort_workflow"
+    notify: ["coordinator"]
